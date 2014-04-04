@@ -53,6 +53,7 @@ static NSString *const FICImageTableFormatKey = @"format";
     NSCountedSet *_chunkSet;
     
     NSRecursiveLock *_lock;
+    CFMutableDictionaryRef _indexNumbers;
     
     // Image table metadata
     NSMutableDictionary *_indexMap;         // Key: entity UUID, value: integer index into the table file
@@ -61,7 +62,12 @@ static NSString *const FICImageTableFormatKey = @"format";
     NSMutableOrderedSet *_MRUEntries;
     NSCountedSet *_inUseEntries;
     NSDictionary *_imageFormatDictionary;
+    
+    NSString *_fileDataProtectionMode;
+    BOOL _canAccessData;
 }
+
+@property (nonatomic, weak) FICImageCache *imageCache;
 
 @end
 
@@ -120,15 +126,22 @@ static NSString *const FICImageTableFormatKey = @"format";
 
 #pragma mark - Object Lifecycle
 
-- (instancetype)initWithFormat:(FICImageFormat *)imageFormat {
+- (instancetype)initWithFormat:(FICImageFormat *)imageFormat imageCache:(FICImageCache *)imageCache {
     self = [super init];
     
     if (self != nil) {
         if (imageFormat == nil) {
             [NSException raise:NSInvalidArgumentException format:@"*** FIC Exception: %s must pass in an image format.", __PRETTY_FUNCTION__];
         }
+        if (imageCache == nil) {
+            [NSException raise:NSInvalidArgumentException format:@"*** FIC Exception: %s must pass in an image cache.", __PRETTY_FUNCTION__];
+        }
+        
+        self.imageCache = imageCache;
         
         _lock = [[NSRecursiveLock alloc] init];
+        _indexNumbers = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, &kCFTypeDictionaryValueCallBacks);
+        
         _imageFormat = [imageFormat copy];
         _imageFormatDictionary = [imageFormat dictionaryRepresentation];
         
@@ -154,6 +167,16 @@ static NSString *const FICImageTableFormatKey = @"format";
         
         [self _loadMetadata];
         
+        NSFileManager *fileManager = [[NSFileManager alloc] init];
+        if ([fileManager fileExistsAtPath:_filePath] == NO) {
+            NSMutableDictionary *attributes = [NSMutableDictionary dictionary];
+            [attributes setValue:[_imageFormat protectionModeString] forKeyPath:NSFileProtectionKey];
+            [fileManager createFileAtPath:_filePath contents:nil attributes:attributes];
+        }
+       
+        NSDictionary *attributes = [fileManager attributesOfItemAtPath:_filePath error:NULL];
+        _fileDataProtectionMode = [attributes objectForKey:NSFileProtectionKey];
+        
         _fileDescriptor = open([_filePath fileSystemRepresentation], O_RDWR | O_CREAT, 0666);
         
         if (_fileDescriptor >= 0) {
@@ -167,7 +190,7 @@ static NSString *const FICImageTableFormatKey = @"format";
             _entriesPerChunk = MAX(4, goalEntriesPerChunk);
             if ([self _maximumCount] > [_imageFormat maximumCount]) {
                 NSString *message = [NSString stringWithFormat:@"*** FIC Warning: growing desired maximumCount (%ld) for format %@ to fill a chunk (%d)", (long)[_imageFormat maximumCount], [_imageFormat name], [self _maximumCount]];
-                [[FICImageCache sharedImageCache] _logMessage:message];
+                [self.imageCache _logMessage:message];
             }
             _chunkLength = (size_t)(_entryLength * _entriesPerChunk);
             
@@ -183,7 +206,7 @@ static NSString *const FICImageTableFormatKey = @"format";
         } else {
             // If something goes wrong and we can't open the image table file, then we have no choice but to release and nil self.
             NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s could not open the image table file at path %@. The image table was not created.", __PRETTY_FUNCTION__, _filePath];
-            [[FICImageCache sharedImageCache] _logMessage:message];
+            [self.imageCache _logMessage:message];
 
             self = nil;
         }    
@@ -193,7 +216,7 @@ static NSString *const FICImageTableFormatKey = @"format";
 }
 
 - (instancetype)init {
-    return [self initWithFormat:nil];
+    return [self initWithFormat:nil imageCache:nil];
 }
 
 - (void)dealloc {
@@ -236,8 +259,8 @@ static NSString *const FICImageTableFormatKey = @"format";
     }
     
     if (!chunk) {
-        NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s failed to get chunk for index %d.", __PRETTY_FUNCTION__, index];
-        [[FICImageCache sharedImageCache] _logMessage:message];
+        NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s failed to get chunk for index %ld.", __PRETTY_FUNCTION__, (long)index];
+        [self.imageCache _logMessage:message];
     }
     
     return chunk;
@@ -254,7 +277,11 @@ static NSString *const FICImageTableFormatKey = @"format";
             newEntryIndex = [self _nextEntryIndex];
             
             if (newEntryIndex >= _entryCount) {
-                NSInteger newEntryCount = _entryCount + MAX(_entriesPerChunk, newEntryIndex - _entryCount + 1);
+                // Determine how many chunks we need to support new entry index.
+                // Number of entries should always be a multiple of _entriesPerChunk
+                NSInteger numberOfEntriesRequired = newEntryIndex + 1;
+                NSInteger newChunkCount = _entriesPerChunk > 0 ? ((numberOfEntriesRequired + _entriesPerChunk - 1) / _entriesPerChunk) : 0;
+                NSInteger newEntryCount = newChunkCount * _entriesPerChunk;
                 [self _setEntryCount:newEntryCount];
             }
         }
@@ -267,17 +294,7 @@ static NSString *const FICImageTableFormatKey = @"format";
             
             // Create context whose backing store *is* the mapped file data
             FICImageTableEntry *entryData = [self _entryDataAtIndex:newEntryIndex];
-            if (entryData) {
-                CGContextRef context = CGBitmapContextCreate([entryData bytes], pixelSize.width, pixelSize.height, bitsPerComponent, _imageRowLength, colorSpace, bitmapInfo);
-                CGColorSpaceRelease(colorSpace);
-                
-                CGContextTranslateCTM(context, 0, pixelSize.height);
-                CGContextScaleCTM(context, _screenScale, -_screenScale);
-                
-                // Call drawing block to allow client to draw into the context
-                imageDrawingBlock(context, [_imageFormat imageSize]);
-                CGContextRelease(context);
-                
+            if (entryData != nil) {
                 [entryData setEntityUUIDBytes:FICUUIDBytesWithString(entityUUID)];
                 [entryData setSourceImageUUIDBytes:FICUUIDBytesWithString(sourceImageUUID)];
                 
@@ -290,12 +307,33 @@ static NSString *const FICImageTableFormatKey = @"format";
                 [self _entryWasAccessedWithEntityUUID:entityUUID];
                 [self saveMetadata];
                 
-                // Write the data back to the filesystem
-                [entryData flush];
+                // Unique, unchanging pointer for this entry's index
+                NSNumber *indexNumber = [self _numberForEntryAtIndex:newEntryIndex];
+                
+                // Relinquish the image table lock before calling potentially slow imageDrawingBlock to unblock other FIC operations
+                [_lock unlock];
+                
+                CGContextRef context = CGBitmapContextCreate([entryData bytes], pixelSize.width, pixelSize.height, bitsPerComponent, _imageRowLength, colorSpace, bitmapInfo);
+                
+                CGContextTranslateCTM(context, 0, pixelSize.height);
+                CGContextScaleCTM(context, _screenScale, -_screenScale);
+                
+                @synchronized(indexNumber) {
+                    // Call drawing block to allow client to draw into the context
+                    imageDrawingBlock(context, [_imageFormat imageSize]);
+                    CGContextRelease(context);
+                
+                    // Write the data back to the filesystem
+                    [entryData flush];
+                }
+            } else {
+                [_lock unlock];
             }
+            
+            CGColorSpaceRelease(colorSpace);
+        } else {
+            [_lock unlock];
         }
-        
-        [_lock unlock];
     }
 }
 
@@ -312,42 +350,44 @@ static NSString *const FICImageTableFormatKey = @"format";
             BOOL entityUUIDIsCorrect = entityUUID == nil || [entityUUID isEqualToString:entryEntityUUID];
             BOOL sourceImageUUIDIsCorrect = sourceImageUUID == nil || [sourceImageUUID isEqualToString:entrySourceImageUUID];
             
-            if (entityUUIDIsCorrect == NO || sourceImageUUIDIsCorrect == NO) {
-                // The UUIDs don't match, so we need to invalidate the entry.
-                [self deleteEntryForEntityUUID:entityUUID];
-                [self saveMetadata];
-            } else {
-                [self _entryWasAccessedWithEntityUUID:entityUUID];
-                
-                // Create CGImageRef whose backing store *is* the mapped image table entry. We avoid a memcpy this way.
-                CGDataProviderRef dataProvider = CGDataProviderCreateWithData((__bridge_retained void *)entryData, [entryData bytes], [entryData imageLength], _FICReleaseImageData);
-                
-                [_inUseEntries addObject:entityUUID];
-                __weak FICImageTable *weakSelf = self;
-                [entryData executeBlockOnDealloc:^{
-                    [weakSelf removeInUseForEntityUUID:entityUUID];
-                }];
-
-                CGSize pixelSize = [_imageFormat pixelSize];
-                CGBitmapInfo bitmapInfo = [_imageFormat bitmapInfo];
-                NSInteger bitsPerComponent = [_imageFormat bitsPerComponent];
-                NSInteger bitsPerPixel = [_imageFormat bytesPerPixel] * 8;
-                CGColorSpaceRef colorSpace = [_imageFormat isGrayscale] ? CGColorSpaceCreateDeviceGray() : CGColorSpaceCreateDeviceRGB();
-
-                CGImageRef imageRef = CGImageCreate(pixelSize.width, pixelSize.height, bitsPerComponent, bitsPerPixel, _imageRowLength, colorSpace, bitmapInfo, dataProvider, NULL, false, (CGColorRenderingIntent)0);
-                CGDataProviderRelease(dataProvider);
-                CGColorSpaceRelease(colorSpace);
-                
-                if (imageRef != NULL) {
-                    image = [[UIImage alloc] initWithCGImage:imageRef scale:_screenScale orientation:UIImageOrientationUp];
-                    CGImageRelease(imageRef);
+            NSNumber *indexNumber = [self _numberForEntryAtIndex:[entryData index]];
+            @synchronized(indexNumber) {
+                if (entityUUIDIsCorrect == NO || sourceImageUUIDIsCorrect == NO) {
+                    // The UUIDs don't match, so we need to invalidate the entry.
+                    [self deleteEntryForEntityUUID:entityUUID];
                 } else {
-                    NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s could not create a new CGImageRef for entity UUID %@.", __PRETTY_FUNCTION__, entityUUID];
-                    [[FICImageCache sharedImageCache] _logMessage:message];
-                }
-                
-                if (image != nil && preheatData) {
-                    [entryData preheat];
+                    [self _entryWasAccessedWithEntityUUID:entityUUID];
+                    
+                    // Create CGImageRef whose backing store *is* the mapped image table entry. We avoid a memcpy this way.
+                    CGDataProviderRef dataProvider = CGDataProviderCreateWithData((__bridge_retained void *)entryData, [entryData bytes], [entryData imageLength], _FICReleaseImageData);
+                    
+                    [_inUseEntries addObject:entityUUID];
+                    __weak FICImageTable *weakSelf = self;
+                    [entryData executeBlockOnDealloc:^{
+                        [weakSelf removeInUseForEntityUUID:entityUUID];
+                    }];
+                    
+                    CGSize pixelSize = [_imageFormat pixelSize];
+                    CGBitmapInfo bitmapInfo = [_imageFormat bitmapInfo];
+                    NSInteger bitsPerComponent = [_imageFormat bitsPerComponent];
+                    NSInteger bitsPerPixel = [_imageFormat bytesPerPixel] * 8;
+                    CGColorSpaceRef colorSpace = [_imageFormat isGrayscale] ? CGColorSpaceCreateDeviceGray() : CGColorSpaceCreateDeviceRGB();
+                    
+                    CGImageRef imageRef = CGImageCreate(pixelSize.width, pixelSize.height, bitsPerComponent, bitsPerPixel, _imageRowLength, colorSpace, bitmapInfo, dataProvider, NULL, false, (CGColorRenderingIntent)0);
+                    CGDataProviderRelease(dataProvider);
+                    CGColorSpaceRelease(colorSpace);
+                    
+                    if (imageRef != NULL) {
+                        image = [[UIImage alloc] initWithCGImage:imageRef scale:_screenScale orientation:UIImageOrientationUp];
+                        CGImageRelease(imageRef);
+                    } else {
+                        NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s could not create a new CGImageRef for entity UUID %@.", __PRETTY_FUNCTION__, entityUUID];
+                        [self.imageCache _logMessage:message];
+                    }
+                    
+                    if (image != nil && preheatData) {
+                        [entryData preheat];
+                    }
                 }
             }
         }
@@ -383,6 +423,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
             if (index != NSNotFound) {
                 [_MRUEntries removeObjectAtIndex:index];
             }
+            [self saveMetadata];
         }
         
         [_lock unlock];
@@ -407,7 +448,6 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
         if (entityUUIDIsCorrect == NO || sourceImageUUIDIsCorrect == NO) {
             // The source image UUIDs don't match, so the image data should be deleted for this entity.
             [self deleteEntryForEntityUUID:entityUUID];
-            [self saveMetadata];
             entryData = nil;
         }
     }
@@ -432,21 +472,55 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
         
         if (result != 0) {
             NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s ftruncate returned %d, error = %d, fd = %d, filePath = %@, length = %lld", __PRETTY_FUNCTION__, result, errno, _fileDescriptor, _filePath, fileLength];
-            [[FICImageCache sharedImageCache] _logMessage:message];
+            [self.imageCache _logMessage:message];
         } else {
             _fileLength = fileLength;
             _entryCount = entryCount;
             _chunkCount = _entriesPerChunk > 0 ? ((_entryCount + _entriesPerChunk - 1) / _entriesPerChunk) : 0;
+            
+            NSDictionary *chunkDictionary = [_chunkDictionary copy];
+            for (FICImageTableChunk *chunk in [chunkDictionary allValues]) {
+                if ([chunk length] != _chunkLength) {
+                    // Issue 31: https://github.com/path/FastImageCache/issues/31
+                    // Somehow, we have a partial chunk whose length needs to be adjusted
+                    // since we changed our file length.
+                    [self _setChunk:nil index:[chunk index]];
+                }
+            }
         }
     }
+}
+
+// There's inherently a race condition between when you ask whether the data is
+// accessible and when you try to use that data. Sidestep this issue altogether
+// by using NSFileProtectionNone
+- (BOOL)canAccessEntryData {
+    BOOL result = YES;
+    if ([_fileDataProtectionMode isEqualToString:NSFileProtectionComplete]) {
+        result = [[UIApplication sharedApplication] isProtectedDataAvailable];
+    } else if ([_fileDataProtectionMode isEqualToString:NSFileProtectionCompleteUntilFirstUserAuthentication]) {
+        // For "complete until first auth", if we were previously able to access data, then we'll still be able to
+        // access it. If we haven't yet been able to access data, we'll need to try until we are successful.
+        if (_canAccessData == NO) {
+            if ([[UIApplication sharedApplication] isProtectedDataAvailable]) {
+                // we are unlocked, so we're good to go.
+                _canAccessData = YES;
+            } else {
+                // we are locked, so try to access data.
+                _canAccessData = [NSData dataWithContentsOfMappedFile:_filePath] != nil;
+            }
+        }
+    }
+    return result;
 }
 
 - (FICImageTableEntry *)_entryDataAtIndex:(NSInteger)index {
     FICImageTableEntry *entryData = nil;
     
     [_lock lock];
-    
-    if (index < _entryCount) {
+
+    BOOL canAccessData = [self canAccessEntryData];
+    if (index < _entryCount && canAccessData) {
         off_t entryOffset = index * _entryLength;
         size_t chunkIndex = (size_t)(entryOffset / _chunkLength);
         
@@ -458,20 +532,29 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
             void *mappedEntryAddress = mappedChunkAddress + entryOffsetInChunk;
             entryData = [[FICImageTableEntry alloc] initWithImageTableChunk:chunk bytes:mappedEntryAddress length:_entryLength];
             
-            [_chunkSet addObject:chunk];
+            if (entryData) {
+                [entryData setImageCache:self.imageCache];
+                [entryData setIndex:index];
+                [_chunkSet addObject:chunk];
             
-            __weak FICImageTable *weakSelf = self;
-            [entryData executeBlockOnDealloc:^{
-                [weakSelf _entryWasDeallocatedFromChunk:chunk];
-            }];
+                __weak FICImageTable *weakSelf = self;
+                [entryData executeBlockOnDealloc:^{
+                    [weakSelf _entryWasDeallocatedFromChunk:chunk];
+                }];
+            }
         }
     }
     
     [_lock unlock];
     
     if (!entryData) {
-        NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s failed to get entry for index %d.", __PRETTY_FUNCTION__, index];
-        [[FICImageCache sharedImageCache] _logMessage:message];
+        NSString *message = nil;
+        if (canAccessData) {
+            message = [NSString stringWithFormat:@"*** FIC Error: %s failed to get entry for index %ld.", __PRETTY_FUNCTION__, (long)index];
+        } else {
+            message = [NSString stringWithFormat:@"*** FIC Error: %s. Cannot get entry data because imageTable's file has data protection enabled and that data is not currently accessible.", __PRETTY_FUNCTION__];
+        }
+        [self.imageCache _logMessage:message];
     }
     
     return entryData;
@@ -507,7 +590,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
 
     if (index >= [self _maximumCount]) {
         NSString *message = [NSString stringWithFormat:@"FICImageTable - unable to evict entry from table '%@' to make room. New index %ld, desired max %d", [_imageFormat name], (long)index, [self _maximumCount]];
-        [[FICImageCache sharedImageCache] _logMessage:message];
+        [self.imageCache _logMessage:message];
     }
     
     return index;
@@ -564,26 +647,42 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
     }
 }
 
+// Unchanging pointer value for a given entry index to synchronize on
+- (NSNumber *)_numberForEntryAtIndex:(NSInteger)index {
+    NSNumber *resultNumber = (__bridge id)CFDictionaryGetValue(_indexNumbers, (const void *)index);
+    if (!resultNumber) {
+        resultNumber = [NSNumber numberWithInteger:index];
+        CFDictionarySetValue(_indexNumbers, (const void *)index, (__bridge void *)resultNumber);
+    }
+    return resultNumber;
+}
+
 #pragma mark - Working with Metadata
 
 - (void)saveMetadata {
     [_lock lock];
     
-    NSArray *mruArray = [_MRUEntries array];
     NSDictionary *metadataDictionary = [NSDictionary dictionaryWithObjectsAndKeys:
-        _indexMap, FICImageTableIndexMapKey,
-        _sourceImageMap, FICImageTableContextMapKey,
-        mruArray, FICImageTableMRUArrayKey,
-        _imageFormatDictionary, FICImageTableFormatKey, nil];
-    
-    NSData *data = [NSPropertyListSerialization dataWithPropertyList:metadataDictionary format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
-    BOOL fileWriteResult = [data writeToFile:[self metadataFilePath] atomically:NO];
-    if (fileWriteResult == NO) {
-        NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s couldn't write metadata for format %@", __PRETTY_FUNCTION__, [_imageFormat name]];
-        [[FICImageCache sharedImageCache] _logMessage:message];
-    }
-
+                                        [_indexMap copy], FICImageTableIndexMapKey,
+                                        [_sourceImageMap copy], FICImageTableContextMapKey,
+                                        [[_MRUEntries array] copy], FICImageTableMRUArrayKey,
+                                        [_imageFormatDictionary copy], FICImageTableFormatKey, nil];
     [_lock unlock];
+    
+    static dispatch_queue_t __metadataQueue = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        __metadataQueue = dispatch_queue_create("com.path.FastImageCache.ImageTableMetadataQueue", NULL);
+    });
+    
+    dispatch_async(__metadataQueue, ^{
+        NSData *data = [NSPropertyListSerialization dataWithPropertyList:metadataDictionary format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+        BOOL fileWriteResult = [data writeToFile:[self metadataFilePath] atomically:NO];
+        if (fileWriteResult == NO) {
+            NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s couldn't write metadata for format %@", __PRETTY_FUNCTION__, [_imageFormat name]];
+            [self.imageCache _logMessage:message];
+        }
+    });
 }
 
 - (void)_loadMetadata {
@@ -600,7 +699,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
             metadataDictionary = nil;
             
             NSString *message = [NSString stringWithFormat:@"*** FIC Notice: Image format %@ has changed; deleting data and starting over.", [_imageFormat name]];
-            [[FICImageCache sharedImageCache] _logMessage:message];
+            [self.imageCache _logMessage:message];
         }
         
         [_indexMap setDictionary:[metadataDictionary objectForKey:FICImageTableIndexMapKey]];
@@ -630,6 +729,8 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
     [_inUseEntries removeAllObjects];
     [_MRUEntries removeAllObjects];
     [_sourceImageMap removeAllObjects];
+    [_chunkDictionary removeAllObjects];
+    [_chunkSet removeAllObjects];
     
     [self _setEntryCount:0];
     [self saveMetadata];
